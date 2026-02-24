@@ -1,0 +1,13 @@
+Device: xpu
+step    1/100 | frac_unhappy=0.686 | avg_sim=0.500 | A=30146 B=30147 empty=5243 | elapsed=0.55s
+step   10/100 | frac_unhappy=0.379 | avg_sim=0.640 | A=30146 B=30147 empty=5243 | elapsed=0.57s
+step   20/100 | frac_unhappy=0.167 | avg_sim=0.802 | A=30146 B=30147 empty=5243 | elapsed=0.59s
+step   30/100 | frac_unhappy=0.072 | avg_sim=0.906 | A=30146 B=30147 empty=5243 | elapsed=0.61s
+step   40/100 | frac_unhappy=0.042 | avg_sim=0.938 | A=30146 B=30147 empty=5243 | elapsed=0.63s
+step   50/100 | frac_unhappy=0.030 | avg_sim=0.952 | A=30146 B=30147 empty=5243 | elapsed=0.65s
+step   60/100 | frac_unhappy=0.023 | avg_sim=0.959 | A=30146 B=30147 empty=5243 | elapsed=0.66s
+step   70/100 | frac_unhappy=0.018 | avg_sim=0.964 | A=30146 B=30147 empty=5243 | elapsed=0.68s
+step   80/100 | frac_unhappy=0.014 | avg_sim=0.968 | A=30146 B=30147 empty=5243 | elapsed=0.70s
+step   90/100 | frac_unhappy=0.010 | avg_sim=0.970 | A=30146 B=30147 empty=5243 | elapsed=0.72s
+step  100/100 | frac_unhappy=0.009 | avg_sim=0.972 | A=30146 B=30147 empty=5243 | elapsed=0.74s
+saved schelling_final.png

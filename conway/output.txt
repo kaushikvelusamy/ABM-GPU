@@ -1,0 +1,12 @@
+python3 2.py 
+Device: xpu
+step    1/200 | alive=13612 (0.208) | elapsed=0.22s
+step   25/200 | alive=8757 (0.134) | elapsed=0.22s
+step   50/200 | alive=7612 (0.116) | elapsed=0.23s
+step   75/200 | alive=6599 (0.101) | elapsed=0.23s
+step  100/200 | alive=5999 (0.092) | elapsed=0.24s
+step  125/200 | alive=5679 (0.087) | elapsed=0.24s
+step  150/200 | alive=5383 (0.082) | elapsed=0.25s
+step  175/200 | alive=5137 (0.078) | elapsed=0.25s
+step  200/200 | alive=4575 (0.070) | elapsed=0.26s
+saved life_final.png
