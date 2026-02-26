@@ -3,10 +3,45 @@ import argparse
 import numpy as np
 from mpi4py import MPI
 
+try:
+    import torch
+except ImportError:
+    torch = None
 
-SUSCEPTIBLE = np.int8(0)
-INFECTED = np.int8(1)
-RECOVERED = np.int8(2)
+
+SUSCEPTIBLE = 0
+INFECTED = 1
+RECOVERED = 2
+
+
+def pick_device():
+    if torch is None:
+        return None
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    return torch.device("cpu")
+
+
+def resolve_backend(backend):
+    if backend == "cpu":
+        return "numpy", None
+    if torch is None:
+        if backend == "gpu":
+            raise RuntimeError("Requested --backend gpu but PyTorch is not installed.")
+        return "numpy", None
+
+    device = pick_device()
+    if backend == "gpu":
+        if device is None or device.type == "cpu":
+            raise RuntimeError("Requested --backend gpu but no GPU device is available.")
+        return "torch", device
+    if backend == "auto" and device is not None and device.type != "cpu":
+        return "torch", device
+    return "numpy", None
 
 
 def build_cartesian_comm():
@@ -45,11 +80,11 @@ def exchange_halos(grid, comm, north, south, west, east):
     if north != MPI.PROC_NULL:
         grid[0, 1:-1] = recv_top
     else:
-        grid[0, 1:-1] = RECOVERED  # boundary treated as non-infectious
+        grid[0, 1:-1] = np.int8(RECOVERED)  # boundary treated as non-infectious
     if south != MPI.PROC_NULL:
         grid[-1, 1:-1] = recv_bottom
     else:
-        grid[-1, 1:-1] = RECOVERED
+        grid[-1, 1:-1] = np.int8(RECOVERED)
 
     # Columns (need contiguous temp buffers)
     send_left = np.ascontiguousarray(grid[1:-1, 1])
@@ -63,9 +98,51 @@ def exchange_halos(grid, comm, north, south, west, east):
     if west != MPI.PROC_NULL:
         grid[1:-1, 0] = recv_left
     else:
-        grid[1:-1, 0] = RECOVERED
+        grid[1:-1, 0] = np.int8(RECOVERED)
     if east != MPI.PROC_NULL:
         grid[1:-1, -1] = recv_right
+    else:
+        grid[1:-1, -1] = np.int8(RECOVERED)
+
+
+def exchange_halos_torch(grid, comm, north, south, west, east):
+    """
+    MPI halo exchange for a torch tensor by staging boundary strips on CPU.
+    grid shape: (local_rows + 2, local_cols + 2), halo-padded torch.int8.
+    """
+    device = grid.device
+
+    send_top = grid[1, 1:-1].to("cpu").contiguous().numpy()
+    send_bottom = grid[-2, 1:-1].to("cpu").contiguous().numpy()
+    recv_top = np.empty_like(send_top)
+    recv_bottom = np.empty_like(send_bottom)
+
+    comm.Sendrecv(sendbuf=send_top, dest=north, sendtag=10, recvbuf=recv_bottom, source=south, recvtag=10)
+    comm.Sendrecv(sendbuf=send_bottom, dest=south, sendtag=11, recvbuf=recv_top, source=north, recvtag=11)
+
+    if north != MPI.PROC_NULL:
+        grid[0, 1:-1] = torch.as_tensor(recv_top, device=device, dtype=torch.int8)
+    else:
+        grid[0, 1:-1] = RECOVERED
+    if south != MPI.PROC_NULL:
+        grid[-1, 1:-1] = torch.as_tensor(recv_bottom, device=device, dtype=torch.int8)
+    else:
+        grid[-1, 1:-1] = RECOVERED
+
+    send_left = grid[1:-1, 1].to("cpu").contiguous().numpy()
+    send_right = grid[1:-1, -2].to("cpu").contiguous().numpy()
+    recv_left = np.empty_like(send_left)
+    recv_right = np.empty_like(send_right)
+
+    comm.Sendrecv(sendbuf=send_left, dest=west, sendtag=20, recvbuf=recv_right, source=east, recvtag=20)
+    comm.Sendrecv(sendbuf=send_right, dest=east, sendtag=21, recvbuf=recv_left, source=west, recvtag=21)
+
+    if west != MPI.PROC_NULL:
+        grid[1:-1, 0] = torch.as_tensor(recv_left, device=device, dtype=torch.int8)
+    else:
+        grid[1:-1, 0] = RECOVERED
+    if east != MPI.PROC_NULL:
+        grid[1:-1, -1] = torch.as_tensor(recv_right, device=device, dtype=torch.int8)
     else:
         grid[1:-1, -1] = RECOVERED
 
@@ -79,6 +156,7 @@ def run_spatial_sir(
     infected_frac0=0.001,
     seed=0,
     output_prefix="sir_neighbor",
+    backend="auto",
 ):
     comm, dims, north, south, west, east = build_cartesian_comm()
     rank = comm.Get_rank()
@@ -87,50 +165,100 @@ def run_spatial_sir(
     _, local_rows = split_axis(global_rows, coords[0], dims[0])
     _, local_cols = split_axis(global_cols, coords[1], dims[1])
 
-    rng = np.random.default_rng(seed + rank)
+    engine, device = resolve_backend(backend)
+    if rank == 0:
+        if engine == "torch":
+            print(f"Backend: torch ({device})")
+        else:
+            print("Backend: numpy (cpu)")
 
-    # Local state with 1-cell halo border.
-    grid = np.full((local_rows + 2, local_cols + 2), SUSCEPTIBLE, dtype=np.int8)
-    interior = grid[1:-1, 1:-1]
-
-    # Initial infection as Bernoulli sample on local subdomain.
-    interior[rng.random((local_rows, local_cols)) < infected_frac0] = INFECTED
+    if engine == "torch":
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed + rank)
+        grid = torch.full(
+            (local_rows + 2, local_cols + 2),
+            SUSCEPTIBLE,
+            dtype=torch.int8,
+            device=device,
+        )
+        interior = grid[1:-1, 1:-1]
+        interior[torch.rand((local_rows, local_cols), generator=rng, device=device) < infected_frac0] = INFECTED
+    else:
+        rng = np.random.default_rng(seed + rank)
+        grid = np.full((local_rows + 2, local_cols + 2), SUSCEPTIBLE, dtype=np.int8)
+        interior = grid[1:-1, 1:-1]
+        interior[rng.random((local_rows, local_cols)) < infected_frac0] = INFECTED
 
     s_hist, i_hist, r_hist = [], [], []
 
     for _ in range(steps + 1):
-        # Local-only communication: each rank talks only to N/S/E/W neighbors.
-        exchange_halos(grid, comm, north, south, west, east)
+        if engine == "torch":
+            exchange_halos_torch(grid, comm, north, south, west, east)
 
-        c = grid[1:-1, 1:-1]
-        n = grid[0:-2, 1:-1]
-        s = grid[2:, 1:-1]
-        w = grid[1:-1, 0:-2]
-        e = grid[1:-1, 2:]
+            c = grid[1:-1, 1:-1]
+            n = grid[0:-2, 1:-1]
+            s = grid[2:, 1:-1]
+            w = grid[1:-1, 0:-2]
+            e = grid[1:-1, 2:]
 
-        infected_neighbors = (
-            (n == INFECTED).astype(np.int8)
-            + (s == INFECTED).astype(np.int8)
-            + (w == INFECTED).astype(np.int8)
-            + (e == INFECTED).astype(np.int8)
-        )
+            infected_neighbors = (
+                (n == INFECTED).to(torch.int8)
+                + (s == INFECTED).to(torch.int8)
+                + (w == INFECTED).to(torch.int8)
+                + (e == INFECTED).to(torch.int8)
+            )
 
-        susceptible_mask = c == SUSCEPTIBLE
-        infected_mask = c == INFECTED
+            susceptible_mask = c == SUSCEPTIBLE
+            infected_mask = c == INFECTED
 
-        # If k infected neighbors exist, infection probability is 1 - (1-beta)^k.
-        p_infect = 1.0 - np.power(1.0 - beta, infected_neighbors)
-        new_infected = susceptible_mask & (rng.random(c.shape) < p_infect)
-        new_recovered = infected_mask & (rng.random(c.shape) < gamma)
+            p_infect = 1.0 - torch.pow(1.0 - beta, infected_neighbors.to(torch.float32))
+            new_infected = susceptible_mask & (
+                torch.rand(c.shape, generator=rng, device=device) < p_infect
+            )
+            new_recovered = infected_mask & (
+                torch.rand(c.shape, generator=rng, device=device) < gamma
+            )
 
-        next_c = c.copy()
-        next_c[new_infected] = INFECTED
-        next_c[new_recovered] = RECOVERED
-        grid[1:-1, 1:-1] = next_c
+            next_c = c.clone()
+            next_c[new_infected] = INFECTED
+            next_c[new_recovered] = RECOVERED
+            grid[1:-1, 1:-1] = next_c
 
-        local_s = np.int64(np.count_nonzero(next_c == SUSCEPTIBLE))
-        local_i = np.int64(np.count_nonzero(next_c == INFECTED))
-        local_r = np.int64(np.count_nonzero(next_c == RECOVERED))
+            local_s = np.int64(int((next_c == SUSCEPTIBLE).sum().item()))
+            local_i = np.int64(int((next_c == INFECTED).sum().item()))
+            local_r = np.int64(int((next_c == RECOVERED).sum().item()))
+        else:
+            exchange_halos(grid, comm, north, south, west, east)
+
+            c = grid[1:-1, 1:-1]
+            n = grid[0:-2, 1:-1]
+            s = grid[2:, 1:-1]
+            w = grid[1:-1, 0:-2]
+            e = grid[1:-1, 2:]
+
+            infected_neighbors = (
+                (n == INFECTED).astype(np.int8)
+                + (s == INFECTED).astype(np.int8)
+                + (w == INFECTED).astype(np.int8)
+                + (e == INFECTED).astype(np.int8)
+            )
+
+            susceptible_mask = c == SUSCEPTIBLE
+            infected_mask = c == INFECTED
+
+            # If k infected neighbors exist, infection probability is 1 - (1-beta)^k.
+            p_infect = 1.0 - np.power(1.0 - beta, infected_neighbors)
+            new_infected = susceptible_mask & (rng.random(c.shape) < p_infect)
+            new_recovered = infected_mask & (rng.random(c.shape) < gamma)
+
+            next_c = c.copy()
+            next_c[new_infected] = INFECTED
+            next_c[new_recovered] = RECOVERED
+            grid[1:-1, 1:-1] = next_c
+
+            local_s = np.int64(np.count_nonzero(next_c == SUSCEPTIBLE))
+            local_i = np.int64(np.count_nonzero(next_c == INFECTED))
+            local_r = np.int64(np.count_nonzero(next_c == RECOVERED))
 
         global_s = comm.allreduce(local_s, op=MPI.SUM)
         global_i = comm.allreduce(local_i, op=MPI.SUM)
@@ -172,6 +300,13 @@ def main():
     parser.add_argument("--infected-frac0", type=float, default=0.001, help="Initial infected fraction")
     parser.add_argument("--seed", type=int, default=0, help="Base random seed")
     parser.add_argument("--out", type=str, default="sir_neighbor", help="Output prefix for CSV")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "gpu"],
+        help="Execution backend: auto (prefer GPU), cpu, or gpu (require GPU)",
+    )
     args = parser.parse_args()
 
     run_spatial_sir(
@@ -183,6 +318,7 @@ def main():
         infected_frac0=args.infected_frac0,
         seed=args.seed,
         output_prefix=args.out,
+        backend=args.backend,
     )
 
 

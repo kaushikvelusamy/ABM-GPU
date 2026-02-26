@@ -15,7 +15,8 @@ Core idea:
 Why this matches "4 of 64 nodes are relevant":
 - A rank only talks to its geometric neighbors, not all 64 ranks.
 - If an infection front is local, only nearby ranks actively exchange impactful state.
-- No global all-to-all infection dependency is used.
+- There is no global all-to-all infection dependency for halo data.
+- Note: all ranks still participate in small global reductions for S/I/R summaries.
 
 State model:
 - 0 = Susceptible
@@ -34,7 +35,7 @@ Environment:
 module load frameworks
 
 Single-node quick run:
-mpiexec -np 8 python sir_neighbor_mpi.py --rows 1024 --cols 1024 --steps 200 --out sir_neighbor
+mpiexec -np 8 python3 sir_neighbor_mpi.py --rows 1024 --cols 1024 --steps 200 --backend auto --out sir_neighbor
 
 PBS-style mpiexec skeleton:
 #!/bin/bash -x
@@ -51,12 +52,17 @@ RANKS_PER_NODE=8
 NRANKS=$(( NNODES * RANKS_PER_NODE ))
 
 mpiexec -np ${NRANKS} -ppn ${RANKS_PER_NODE} \
-  python /lus/flare/projects/datascience/kaushik/ABM-GPU/sir/sir_neighbor_mpi.py \
-  --rows 8192 --cols 8192 --steps 400 --beta 0.20 --gamma 0.04 --infected-frac0 0.0005 --out sir_neighbor
+  python3 /lus/flare/projects/datascience/kaushik/ABM-GPU/sir/sir_neighbor_mpi.py \
+  --rows 8192 --cols 8192 --steps 400 --beta 0.20 --gamma 0.04 --infected-frac0 0.0005 --backend auto --out sir_neighbor
 
 Outputs:
 - Rank 0 writes `<out>.csv` with columns:
   step,susceptible,infected,recovered
 
 Replot from CSV:
-python plot_sir_csv.py --csv sir_neighbor.csv --out sir_neighbor.png --title "Neighbor SIR"
+python3 plot_sir_csv.py --csv sir_neighbor.csv --out sir_neighbor.png --title "Neighbor SIR"
+
+Backend options:
+- `--backend auto`: use GPU if available, otherwise CPU.
+- `--backend cpu`: force NumPy CPU path.
+- `--backend gpu`: require GPU (error if no GPU is available).
