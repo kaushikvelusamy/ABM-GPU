@@ -13,6 +13,7 @@ develop-eggs/
 dist/
 downloads/
 eggs/
+results/
 .eggs/
 lib/
 lib64/
@@ -54,6 +55,10 @@ cover/
 # Translations
 *.mo
 *.pot
+*.csv
+*.png
+*.json
+
 
 # Django stuff:
 *.log
