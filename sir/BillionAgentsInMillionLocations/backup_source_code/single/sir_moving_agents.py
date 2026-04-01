@@ -226,6 +226,8 @@ def run_simulation(
     run_dir=None,
     plot_summary_png=False,
     plot_out=None,
+    log_agent_history=True,
+    log_location_history=True,
 ):
     if rows <= 0 or cols <= 0:
         raise ValueError("rows and cols must be positive integers")
@@ -273,6 +275,8 @@ def run_simulation(
         "run_dir": str(run_dir) if run_dir else None,
         "plot_summary_png": plot_summary_png,
         "plot_out": str(plot_out) if plot_out else None,
+        "log_agent_history": bool(log_agent_history),
+        "log_location_history": bool(log_location_history),
         "run_config_json": str(metadata_json),
         "summary_csv": str(summary_csv),
         "agent_history_csv": str(agent_csv),
@@ -283,133 +287,147 @@ def run_simulation(
     }
     write_run_metadata(metadata_json, run_config)
 
-    with open(summary_csv, "w", newline="", encoding="utf-8") as summary_f, open(
-        agent_csv, "w", newline="", encoding="utf-8"
-    ) as agent_f, open(location_csv, "w", newline="", encoding="utf-8") as location_f:
+    with open(summary_csv, "w", newline="", encoding="utf-8") as summary_f:
         summary_writer = csv.writer(summary_f)
-        agent_writer = csv.writer(agent_f)
-        location_writer = csv.writer(location_f)
-
-        summary_writer.writerow(
-            [
-                "step",
-                "susceptible",
-                "infected",
-                "recovered",
-                "occupied_locations",
-                "max_occupancy",
-                "moved_agents",
-            ]
+        agent_f = open(agent_csv, "w", newline="", encoding="utf-8") if log_agent_history else None
+        location_f = (
+            open(location_csv, "w", newline="", encoding="utf-8") if log_location_history else None
         )
-        agent_writer.writerow(
-            [
-                "step",
-                "agent_id",
-                "row",
-                "col",
-                "state",
-                "from_row",
-                "from_col",
-                "to_row",
-                "to_col",
-                "moved",
-                "exposure",
-                "infection_probability",
-                "became_infected",
-                "became_recovered",
-            ]
-        )
-        location_writer.writerow(
-            ["step", "row", "col", "occupancy", "susceptible", "infected", "recovered"]
-        )
-
-        occupancy, s_counts, i_counts, r_counts = build_location_stats(
-            rows, cols, agent_rows, agent_cols, states
-        )
-        summary_writer.writerow(
-            [
-                0,
-                int(s_counts.sum()),
-                int(i_counts.sum()),
-                int(r_counts.sum()),
-                int(np.count_nonzero(occupancy)),
-                int(occupancy.max(initial=0)),
-                0,
-            ]
-        )
-        write_location_rows(location_writer, 0, occupancy, s_counts, i_counts, r_counts)
-        write_agent_rows(
-            agent_writer,
-            0,
-            agent_rows,
-            agent_cols,
-            states,
-            agent_rows,
-            agent_cols,
-            np.zeros(num_agents, dtype=bool),
-            np.zeros(num_agents, dtype=np.int64),
-            np.zeros(num_agents, dtype=np.float64),
-            np.zeros(num_agents, dtype=bool),
-            np.zeros(num_agents, dtype=bool),
-        )
-
-        for step in range(1, steps + 1):
-            old_rows, old_cols, moved = move_agents(
-                agent_rows, agent_cols, rows, cols, move_prob, movement_neighborhood, rng
-            )
-
-            occupancy, s_counts, i_counts, r_counts = build_location_stats(
-                rows, cols, agent_rows, agent_cols, states
-            )
-
-            exposure_grid = i_counts.copy()
-            if infection_neighborhood == "same_plus_news":
-                exposure_grid = exposure_grid + cardinal_neighbor_sum(i_counts)
-
-            exposure = exposure_grid[agent_rows, agent_cols]
-            infection_prob = np.zeros(num_agents, dtype=np.float64)
-            susceptible_mask = states == SUSCEPTIBLE
-            infected_mask = states == INFECTED
-
-            infection_prob[susceptible_mask] = 1.0 - np.power(
-                1.0 - beta, exposure[susceptible_mask]
-            )
-            became_infected = susceptible_mask & (rng.random(num_agents) < infection_prob)
-            became_recovered = infected_mask & (rng.random(num_agents) < gamma)
-
-            states[became_infected] = INFECTED
-            states[became_recovered] = RECOVERED
-
-            occupancy, s_counts, i_counts, r_counts = build_location_stats(
-                rows, cols, agent_rows, agent_cols, states
-            )
+        try:
+            agent_writer = csv.writer(agent_f) if agent_f is not None else None
+            location_writer = csv.writer(location_f) if location_f is not None else None
 
             summary_writer.writerow(
                 [
-                    step,
+                    "step",
+                    "susceptible",
+                    "infected",
+                    "recovered",
+                    "occupied_locations",
+                    "max_occupancy",
+                    "moved_agents",
+                ]
+            )
+            if agent_writer is not None:
+                agent_writer.writerow(
+                    [
+                        "step",
+                        "agent_id",
+                        "row",
+                        "col",
+                        "state",
+                        "from_row",
+                        "from_col",
+                        "to_row",
+                        "to_col",
+                        "moved",
+                        "exposure",
+                        "infection_probability",
+                        "became_infected",
+                        "became_recovered",
+                    ]
+                )
+            if location_writer is not None:
+                location_writer.writerow(
+                    ["step", "row", "col", "occupancy", "susceptible", "infected", "recovered"]
+                )
+
+            occupancy, s_counts, i_counts, r_counts = build_location_stats(
+                rows, cols, agent_rows, agent_cols, states
+            )
+            summary_writer.writerow(
+                [
+                    0,
                     int(s_counts.sum()),
                     int(i_counts.sum()),
                     int(r_counts.sum()),
                     int(np.count_nonzero(occupancy)),
                     int(occupancy.max(initial=0)),
-                    int(moved.sum()),
+                    0,
                 ]
             )
-            write_location_rows(location_writer, step, occupancy, s_counts, i_counts, r_counts)
-            write_agent_rows(
-                agent_writer,
-                step,
-                agent_rows,
-                agent_cols,
-                states,
-                old_rows,
-                old_cols,
-                moved,
-                exposure,
-                infection_prob,
-                became_infected,
-                became_recovered,
-            )
+            if location_writer is not None:
+                write_location_rows(location_writer, 0, occupancy, s_counts, i_counts, r_counts)
+            if agent_writer is not None:
+                write_agent_rows(
+                    agent_writer,
+                    0,
+                    agent_rows,
+                    agent_cols,
+                    states,
+                    agent_rows,
+                    agent_cols,
+                    np.zeros(num_agents, dtype=bool),
+                    np.zeros(num_agents, dtype=np.int64),
+                    np.zeros(num_agents, dtype=np.float64),
+                    np.zeros(num_agents, dtype=bool),
+                    np.zeros(num_agents, dtype=bool),
+                )
+
+            for step in range(1, steps + 1):
+                old_rows, old_cols, moved = move_agents(
+                    agent_rows, agent_cols, rows, cols, move_prob, movement_neighborhood, rng
+                )
+
+                occupancy, s_counts, i_counts, r_counts = build_location_stats(
+                    rows, cols, agent_rows, agent_cols, states
+                )
+
+                exposure_grid = i_counts.copy()
+                if infection_neighborhood == "same_plus_news":
+                    exposure_grid = exposure_grid + cardinal_neighbor_sum(i_counts)
+
+                exposure = exposure_grid[agent_rows, agent_cols]
+                infection_prob = np.zeros(num_agents, dtype=np.float64)
+                susceptible_mask = states == SUSCEPTIBLE
+                infected_mask = states == INFECTED
+
+                infection_prob[susceptible_mask] = 1.0 - np.power(
+                    1.0 - beta, exposure[susceptible_mask]
+                )
+                became_infected = susceptible_mask & (rng.random(num_agents) < infection_prob)
+                became_recovered = infected_mask & (rng.random(num_agents) < gamma)
+
+                states[became_infected] = INFECTED
+                states[became_recovered] = RECOVERED
+
+                occupancy, s_counts, i_counts, r_counts = build_location_stats(
+                    rows, cols, agent_rows, agent_cols, states
+                )
+
+                summary_writer.writerow(
+                    [
+                        step,
+                        int(s_counts.sum()),
+                        int(i_counts.sum()),
+                        int(r_counts.sum()),
+                        int(np.count_nonzero(occupancy)),
+                        int(occupancy.max(initial=0)),
+                        int(moved.sum()),
+                    ]
+                )
+                if location_writer is not None:
+                    write_location_rows(location_writer, step, occupancy, s_counts, i_counts, r_counts)
+                if agent_writer is not None:
+                    write_agent_rows(
+                        agent_writer,
+                        step,
+                        agent_rows,
+                        agent_cols,
+                        states,
+                        old_rows,
+                        old_cols,
+                        moved,
+                        exposure,
+                        infection_prob,
+                        became_infected,
+                        became_recovered,
+                    )
+        finally:
+            if agent_f is not None:
+                agent_f.close()
+            if location_f is not None:
+                location_f.close()
 
     final_s = int(np.count_nonzero(states == SUSCEPTIBLE))
     final_i = int(np.count_nonzero(states == INFECTED))
@@ -439,6 +457,7 @@ def run_simulation(
         f"Parameters: beta={beta}, gamma={gamma}, steps={steps}, seed={seed} "
         "(step is a discrete simulation timestep; interpret as days if one step = one day)"
     )
+    print(f"Logging: agent_history={int(bool(log_agent_history))}, location_history={int(bool(log_location_history))}")
     print(f"Final: S={final_s} I={final_i} R={final_r}")
     print(f"Runtime: {runtime_seconds:.3f} s")
     if peak_memory_mb_used is not None:
@@ -449,8 +468,10 @@ def run_simulation(
     )
     print("Saved outputs:")
     print(f"  {summary_csv} ({human_readable_size(summary_csv)})")
-    print(f"  {agent_csv} ({human_readable_size(agent_csv)})")
-    print(f"  {location_csv} ({human_readable_size(location_csv)})")
+    if log_agent_history and Path(agent_csv).exists():
+        print(f"  {agent_csv} ({human_readable_size(agent_csv)})")
+    if log_location_history and Path(location_csv).exists():
+        print(f"  {location_csv} ({human_readable_size(location_csv)})")
     print(f"  {metadata_json} ({human_readable_size(metadata_json)})")
     if plot_summary_png:
         try:
@@ -535,6 +556,20 @@ def main():
         default=None,
         help="Optional PNG path for the summary plot; default derives it from the summary CSV name",
     )
+    parser.add_argument(
+        "--log-agent-history",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Write per-agent CSV history: 1=yes, 0=no",
+    )
+    parser.add_argument(
+        "--log-location-history",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Write per-location CSV history: 1=yes, 0=no",
+    )
     args = parser.parse_args()
 
     run_simulation(
@@ -553,6 +588,8 @@ def main():
         run_dir=args.run_dir,
         plot_summary_png=args.plot_summary,
         plot_out=args.plot_out,
+        log_agent_history=bool(args.log_agent_history),
+        log_location_history=bool(args.log_location_history),
     )
 
 

@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,9 @@ STATE_NAME = {
     INFECTED: "I",
     RECOVERED: "R",
 }
+
+_MOVEMENT_DELTA_CACHE = {}
+MOVE_AGENT_CHUNK_SIZE = 1_000_000
 
 
 def pick_device():
@@ -137,6 +141,16 @@ def movement_deltas(name):
     if name == "stay_news":
         return [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]
     raise ValueError(f"Unsupported movement neighborhood: {name}")
+
+
+def movement_delta_tensor(name, device):
+    device_key = str(device)
+    cache_key = (name, device_key)
+    cached = _MOVEMENT_DELTA_CACHE.get(cache_key)
+    if cached is None:
+        cached = torch.tensor(movement_deltas(name), dtype=torch.int64, device=device)
+        _MOVEMENT_DELTA_CACHE[cache_key] = cached
+    return cached
 
 
 def split_rows(global_rows, rank, world_size):
@@ -316,10 +330,32 @@ def resolve_output_paths(out_prefix, rank, run_dir=None):
     )
 
 
-def build_location_stats(local_rows, cols, agent_rows, agent_cols, states):
+def build_state_counts_from_cell_ids(cell_ids, n_cells, states):
+    s_counts = torch.bincount(
+        cell_ids,
+        weights=(states == SUSCEPTIBLE).to(torch.float32),
+        minlength=n_cells,
+    ).to(torch.int64)
+    i_counts = torch.bincount(
+        cell_ids,
+        weights=(states == INFECTED).to(torch.float32),
+        minlength=n_cells,
+    ).to(torch.int64)
+    r_counts = torch.bincount(
+        cell_ids,
+        weights=(states == RECOVERED).to(torch.float32),
+        minlength=n_cells,
+    ).to(torch.int64)
+    return s_counts, i_counts, r_counts
+
+
+def build_location_stats(local_rows, cols, agent_rows, agent_cols, states, return_cell_ids=False):
     n_cells = local_rows * cols
     if agent_rows.numel() == 0:
         zeros = torch.zeros((local_rows, cols), dtype=torch.int64, device=agent_rows.device)
+        if return_cell_ids:
+            empty_ids = torch.empty(0, dtype=torch.int64, device=agent_rows.device)
+            return zeros.clone(), zeros.clone(), zeros.clone(), zeros.clone(), empty_ids
         return zeros.clone(), zeros.clone(), zeros.clone(), zeros.clone()
 
     invalid_mask = (agent_rows < 0) | (agent_rows >= local_rows) | (agent_cols < 0) | (agent_cols >= cols)
@@ -337,27 +373,16 @@ def build_location_stats(local_rows, cols, agent_rows, agent_cols, states):
 
     cell_ids = agent_rows * cols + agent_cols
     occupancy = torch.bincount(cell_ids, minlength=n_cells).to(torch.int64)
-    s_counts = torch.bincount(
-        cell_ids,
-        weights=(states == SUSCEPTIBLE).to(torch.float32),
-        minlength=n_cells,
-    ).to(torch.int64)
-    i_counts = torch.bincount(
-        cell_ids,
-        weights=(states == INFECTED).to(torch.float32),
-        minlength=n_cells,
-    ).to(torch.int64)
-    r_counts = torch.bincount(
-        cell_ids,
-        weights=(states == RECOVERED).to(torch.float32),
-        minlength=n_cells,
-    ).to(torch.int64)
-    return (
+    s_counts, i_counts, r_counts = build_state_counts_from_cell_ids(cell_ids, n_cells, states)
+    result = (
         occupancy.reshape(local_rows, cols),
         s_counts.reshape(local_rows, cols),
         i_counts.reshape(local_rows, cols),
         r_counts.reshape(local_rows, cols),
     )
+    if return_cell_ids:
+        return result + (cell_ids,)
+    return result
 
 
 def cardinal_neighbor_sum_local(grid):
@@ -402,26 +427,52 @@ def move_agents(agent_rows, agent_cols, local_rows, cols, move_prob, movement_ru
     if agent_rows.numel() == 0:
         return old_rows, old_cols, moved
 
-    deltas = movement_deltas(movement_rule)
     want_move = torch.rand(agent_rows.shape[0], generator=generator, device=device) < move_prob
+    if not bool(want_move.any().item()):
+        return old_rows, old_cols, moved
+
+    delta_tensor = movement_delta_tensor(movement_rule, device)
     min_row = -1 if rank > 0 else 0
     max_row = local_rows if rank < world_size - 1 else local_rows - 1
-    for idx in torch.nonzero(want_move, as_tuple=False).flatten().tolist():
-        valid = []
-        current_row = int(agent_rows[idx].item())
-        current_col = int(agent_cols[idx].item())
-        for dr, dc in deltas:
-            nr = current_row + dr
-            nc = current_col + dc
-            if 0 <= nc < cols and min_row <= nr <= max_row:
-                valid.append((dr, dc))
-        if not valid:
+
+    mover_idx = torch.nonzero(want_move, as_tuple=False).flatten()
+    delta_rows = delta_tensor[:, 0]
+    delta_cols = delta_tensor[:, 1]
+    chunk_size = MOVE_AGENT_CHUNK_SIZE
+
+    for chunk_start in range(0, int(mover_idx.shape[0]), chunk_size):
+        chunk_end = min(chunk_start + chunk_size, int(mover_idx.shape[0]))
+        chunk_idx = mover_idx[chunk_start:chunk_end]
+        mover_rows = agent_rows[chunk_idx]
+        mover_cols = agent_cols[chunk_idx]
+
+        candidate_rows = mover_rows[:, None] + delta_rows[None, :]
+        candidate_cols = mover_cols[:, None] + delta_cols[None, :]
+        valid = (
+            (candidate_cols >= 0)
+            & (candidate_cols < cols)
+            & (candidate_rows >= min_row)
+            & (candidate_rows <= max_row)
+        )
+
+        has_valid = valid.any(dim=1)
+        if not bool(has_valid.any().item()):
             continue
-        choice = int(torch.randint(len(valid), (1,), generator=generator, device=device).item())
-        dr, dc = valid[choice]
-        agent_rows[idx] = current_row + dr
-        agent_cols[idx] = current_col + dc
-        moved[idx] = (dr != 0) or (dc != 0)
+
+        chooser = torch.rand(candidate_rows.shape, generator=generator, device=device, dtype=torch.float32)
+        chooser = chooser.masked_fill(~valid, -1.0)
+        chosen = chooser.argmax(dim=1)
+
+        selected_rows = candidate_rows.gather(1, chosen[:, None]).squeeze(1)
+        selected_cols = candidate_cols.gather(1, chosen[:, None]).squeeze(1)
+        selected_delta_rows = delta_rows.gather(0, chosen)
+        selected_delta_cols = delta_cols.gather(0, chosen)
+        moved_subset = has_valid & ((selected_delta_rows != 0) | (selected_delta_cols != 0))
+
+        valid_chunk_idx = chunk_idx[has_valid]
+        agent_rows[valid_chunk_idx] = selected_rows[has_valid]
+        agent_cols[valid_chunk_idx] = selected_cols[has_valid]
+        moved[chunk_idx] = moved_subset
 
     return old_rows, old_cols, moved
 
@@ -436,7 +487,8 @@ def migrate_agents(comm, rank, world_size, row0, local_rows, agent_ids, agent_ro
     moved_np = moved.detach().to(torch.int8).to("cpu").numpy()
 
     keep_mask = np.ones(ids_np.shape[0], dtype=bool)
-    outgoing = []
+    send_up = []
+    send_down = []
 
     for idx in range(ids_np.shape[0]):
         local_row = int(rows_np[idx])
@@ -451,18 +503,19 @@ def migrate_agents(comm, rank, world_size, row0, local_rows, agent_ids, agent_ro
             continue
 
         keep_mask[idx] = False
-        outgoing.append(
-            (
-                dest_rank,
-                int(ids_np[idx]),
-                int(global_row),
-                int(cols_np[idx]),
-                int(states_np[idx]),
-                int(old_rows_np[idx]),
-                int(old_cols_np[idx]),
-                int(moved_np[idx]),
-            )
-        )
+        record = [
+            int(ids_np[idx]),
+            int(global_row),
+            int(cols_np[idx]),
+            int(states_np[idx]),
+            int(old_rows_np[idx]),
+            int(old_cols_np[idx]),
+            int(moved_np[idx]),
+        ]
+        if dest_rank == rank - 1:
+            send_up.append(record)
+        else:
+            send_down.append(record)
 
     ids_np = ids_np[keep_mask]
     rows_np = rows_np[keep_mask]
@@ -472,43 +525,61 @@ def migrate_agents(comm, rank, world_size, row0, local_rows, agent_ids, agent_ro
     old_cols_np = old_cols_np[keep_mask]
     moved_np = moved_np[keep_mask]
 
+    send_up_np = np.asarray(send_up, dtype=np.int64).reshape((-1, 7)) if send_up else np.empty((0, 7), dtype=np.int64)
+    send_down_np = np.asarray(send_down, dtype=np.int64).reshape((-1, 7)) if send_down else np.empty((0, 7), dtype=np.int64)
+
+    incoming_parts = []
+    communication_seconds = 0.0
     if world_size > 1:
-        comm_t0 = start_comm_timer()
-        gathered = comm.allgather(outgoing)
-        communication_seconds = stop_comm_timer(comm_t0)
-        incoming = []
-        for source_payload in gathered:
-            for record in source_payload or []:
-                if record[0] == rank:
-                    incoming.append(record)
-    else:
-        incoming = []
-        communication_seconds = 0.0
+        if rank > 0:
+            send_count = np.asarray([send_up_np.shape[0]], dtype=np.int64)
+            recv_count = np.zeros(1, dtype=np.int64)
+            comm_t0 = start_comm_timer()
+            comm.Sendrecv(sendbuf=send_count, dest=rank - 1, sendtag=100, recvbuf=recv_count, source=rank - 1, recvtag=101)
+            communication_seconds += stop_comm_timer(comm_t0)
+            recv_from_up = np.empty((int(recv_count[0]), 7), dtype=np.int64)
+            comm_t0 = start_comm_timer()
+            comm.Sendrecv(
+                sendbuf=send_up_np,
+                dest=rank - 1,
+                sendtag=102,
+                recvbuf=recv_from_up,
+                source=rank - 1,
+                recvtag=103,
+            )
+            communication_seconds += stop_comm_timer(comm_t0)
+            if recv_from_up.size > 0:
+                incoming_parts.append(recv_from_up)
+        if rank < world_size - 1:
+            send_count = np.asarray([send_down_np.shape[0]], dtype=np.int64)
+            recv_count = np.zeros(1, dtype=np.int64)
+            comm_t0 = start_comm_timer()
+            comm.Sendrecv(sendbuf=send_count, dest=rank + 1, sendtag=101, recvbuf=recv_count, source=rank + 1, recvtag=100)
+            communication_seconds += stop_comm_timer(comm_t0)
+            recv_from_down = np.empty((int(recv_count[0]), 7), dtype=np.int64)
+            comm_t0 = start_comm_timer()
+            comm.Sendrecv(
+                sendbuf=send_down_np,
+                dest=rank + 1,
+                sendtag=103,
+                recvbuf=recv_from_down,
+                source=rank + 1,
+                recvtag=102,
+            )
+            communication_seconds += stop_comm_timer(comm_t0)
+            if recv_from_down.size > 0:
+                incoming_parts.append(recv_from_down)
 
-    if incoming:
-        appended_ids = []
-        appended_rows = []
-        appended_cols = []
-        appended_states = []
-        appended_old_rows = []
-        appended_old_cols = []
-        appended_moved = []
-        for _, agent_id, moved_row, moved_col, state, old_global_row, old_global_col, moved_flag in incoming:
-            appended_ids.append(agent_id)
-            appended_rows.append(moved_row - row0)
-            appended_cols.append(moved_col)
-            appended_states.append(state)
-            appended_old_rows.append(old_global_row)
-            appended_old_cols.append(old_global_col)
-            appended_moved.append(moved_flag)
+    incoming = np.concatenate(incoming_parts, axis=0) if incoming_parts else np.empty((0, 7), dtype=np.int64)
 
-        ids_np = np.concatenate([ids_np, np.asarray(appended_ids, dtype=np.int64)])
-        rows_np = np.concatenate([rows_np, np.asarray(appended_rows, dtype=np.int64)])
-        cols_np = np.concatenate([cols_np, np.asarray(appended_cols, dtype=np.int64)])
-        states_np = np.concatenate([states_np, np.asarray(appended_states, dtype=np.int8)])
-        old_rows_np = np.concatenate([old_rows_np, np.asarray(appended_old_rows, dtype=np.int64)])
-        old_cols_np = np.concatenate([old_cols_np, np.asarray(appended_old_cols, dtype=np.int64)])
-        moved_np = np.concatenate([moved_np, np.asarray(appended_moved, dtype=np.int8)])
+    if incoming.size > 0:
+        ids_np = np.concatenate([ids_np, incoming[:, 0].astype(np.int64, copy=False)])
+        rows_np = np.concatenate([rows_np, (incoming[:, 1] - row0).astype(np.int64, copy=False)])
+        cols_np = np.concatenate([cols_np, incoming[:, 2].astype(np.int64, copy=False)])
+        states_np = np.concatenate([states_np, incoming[:, 3].astype(np.int8, copy=False)])
+        old_rows_np = np.concatenate([old_rows_np, incoming[:, 4].astype(np.int64, copy=False)])
+        old_cols_np = np.concatenate([old_cols_np, incoming[:, 5].astype(np.int64, copy=False)])
+        moved_np = np.concatenate([moved_np, incoming[:, 6].astype(np.int8, copy=False)])
 
     return (
         torch.as_tensor(ids_np, dtype=torch.int64, device=device),
@@ -663,6 +734,9 @@ def run_simulation(
     run_dir=None,
     plot_summary_png=False,
     plot_out=None,
+    log_agent_history=True,
+    log_location_history=True,
+    log_every=1,
 ):
     if torch is None:
         raise RuntimeError("This script requires PyTorch in the current Python environment.")
@@ -672,6 +746,8 @@ def run_simulation(
         raise ValueError("num_agents must be non-negative")
     if steps < 0:
         raise ValueError("steps must be non-negative")
+    if log_every <= 0:
+        raise ValueError("log_every must be a positive integer")
     if not 0.0 <= move_prob <= 1.0:
         raise ValueError("move_prob must be in [0, 1]")
     if not 0.0 <= beta <= 1.0:
@@ -714,6 +790,7 @@ def run_simulation(
 
     generator = torch.Generator(device=device if device.type != "mps" else "cpu")
     generator.manual_seed(seed + rank + 1)
+    beta_base = torch.tensor(1.0 - beta, dtype=torch.float64, device=device)
 
     run_config = {
         "mode": "torch_distributed_row_partition",
@@ -741,6 +818,9 @@ def run_simulation(
         "run_dir": str(run_dir) if run_dir else None,
         "plot_summary_png": plot_summary_png,
         "plot_out": str(plot_out) if plot_out else None,
+        "log_agent_history": bool(log_agent_history),
+        "log_location_history": bool(log_location_history),
+        "log_every": int(log_every),
         "run_config_json": str(metadata_json),
         "summary_csv": str(summary_csv),
         "distributed_runtime_seconds": None,
@@ -765,11 +845,15 @@ def run_simulation(
         write_run_metadata(metadata_json, run_config)
         output_io_seconds_local += time.perf_counter() - io_t0
 
-    with open(agent_csv, "w", newline="", encoding="utf-8") as agent_f, open(location_csv, "w", newline="", encoding="utf-8") as location_f:
-        agent_writer = csv.writer(agent_f)
-        location_writer = csv.writer(location_f)
-        agent_writer.writerow(["step", "rank", "agent_id", "row", "col", "state", "from_row", "from_col", "to_row", "to_col", "moved", "exposure", "infection_probability", "became_infected", "became_recovered"])
-        location_writer.writerow(["step", "rank", "row", "col", "occupancy", "susceptible", "infected", "recovered"])
+    agent_context = open(agent_csv, "w", newline="", encoding="utf-8") if log_agent_history else nullcontext(None)
+    location_context = open(location_csv, "w", newline="", encoding="utf-8") if log_location_history else nullcontext(None)
+    with agent_context as agent_f, location_context as location_f:
+        agent_writer = csv.writer(agent_f) if agent_f is not None else None
+        location_writer = csv.writer(location_f) if location_f is not None else None
+        if agent_writer is not None:
+            agent_writer.writerow(["step", "rank", "agent_id", "row", "col", "state", "from_row", "from_col", "to_row", "to_col", "moved", "exposure", "infection_probability", "became_infected", "became_recovered"])
+        if location_writer is not None:
+            location_writer.writerow(["step", "rank", "row", "col", "occupancy", "susceptible", "infected", "recovered"])
 
         if rank == 0:
             summary_f = open(summary_csv, "w", newline="", encoding="utf-8")
@@ -779,28 +863,34 @@ def run_simulation(
             summary_f = None
             summary_writer = None
 
+        initial_zero_bool = torch.zeros(agent_ids.shape[0], dtype=torch.bool, device=device)
+        initial_zero_i64 = torch.zeros(agent_ids.shape[0], dtype=torch.int64, device=device)
+        initial_zero_f64 = torch.zeros(agent_ids.shape[0], dtype=torch.float64, device=device)
+
         gpu_t0 = start_gpu_timer(device)
         occupancy, s_counts, i_counts, r_counts = build_location_stats(local_rows, cols, agent_rows, agent_cols, states)
         gpu_compute_seconds_local += stop_gpu_timer(device, gpu_t0)
         io_t0 = time.perf_counter()
-        write_local_location_rows(location_writer, 0, rank, row0, occupancy, s_counts, i_counts, r_counts)
-        write_local_agent_rows(
-            agent_writer,
-            0,
-            rank,
-            row0,
-            agent_ids,
-            agent_rows,
-            agent_cols,
-            states,
-            row0 + agent_rows,
-            agent_cols,
-            torch.zeros(agent_ids.shape[0], dtype=torch.bool, device=device),
-            torch.zeros(agent_ids.shape[0], dtype=torch.int64, device=device),
-            torch.zeros(agent_ids.shape[0], dtype=torch.float64, device=device),
-            torch.zeros(agent_ids.shape[0], dtype=torch.bool, device=device),
-            torch.zeros(agent_ids.shape[0], dtype=torch.bool, device=device),
-        )
+        if location_writer is not None:
+            write_local_location_rows(location_writer, 0, rank, row0, occupancy, s_counts, i_counts, r_counts)
+        if agent_writer is not None:
+            write_local_agent_rows(
+                agent_writer,
+                0,
+                rank,
+                row0,
+                agent_ids,
+                agent_rows,
+                agent_cols,
+                states,
+                row0 + agent_rows,
+                agent_cols,
+                initial_zero_bool,
+                initial_zero_i64,
+                initial_zero_f64,
+                initial_zero_bool,
+                initial_zero_bool,
+            )
         output_io_seconds_local += time.perf_counter() - io_t0
 
         local_counts = torch.tensor(
@@ -857,7 +947,14 @@ def run_simulation(
             communication_seconds_local += comm_seconds
 
             gpu_t0 = start_gpu_timer(device)
-            occupancy, s_counts, i_counts, r_counts = build_location_stats(local_rows, cols, agent_rows, agent_cols, states)
+            occupancy, s_counts, i_counts, r_counts, cell_ids = build_location_stats(
+                local_rows,
+                cols,
+                agent_rows,
+                agent_cols,
+                states,
+                return_cell_ids=True,
+            )
             exposure_grid = i_counts.clone()
             if infection_neighborhood == "same_plus_news":
                 exposure_grid = exposure_grid + cardinal_neighbor_sum_local(i_counts)
@@ -875,10 +972,7 @@ def run_simulation(
             susceptible_mask = states == SUSCEPTIBLE
             infected_mask = states == INFECTED
             if susceptible_mask.any():
-                infection_prob[susceptible_mask] = 1.0 - torch.pow(
-                    torch.tensor(1.0 - beta, dtype=torch.float64, device=device),
-                    exposure[susceptible_mask].to(torch.float64),
-                )
+                infection_prob[susceptible_mask] = 1.0 - torch.pow(beta_base, exposure[susceptible_mask].to(torch.float64))
 
             rand_infect = torch.rand(agent_ids.shape[0], generator=generator, device=device, dtype=torch.float64)
             rand_recover = torch.rand(agent_ids.shape[0], generator=generator, device=device, dtype=torch.float64)
@@ -887,27 +981,33 @@ def run_simulation(
             states[became_infected] = INFECTED
             states[became_recovered] = RECOVERED
 
-            occupancy, s_counts, i_counts, r_counts = build_location_stats(local_rows, cols, agent_rows, agent_cols, states)
+            s_counts_flat, i_counts_flat, r_counts_flat = build_state_counts_from_cell_ids(cell_ids, local_rows * cols, states)
+            s_counts = s_counts_flat.reshape(local_rows, cols)
+            i_counts = i_counts_flat.reshape(local_rows, cols)
+            r_counts = r_counts_flat.reshape(local_rows, cols)
             gpu_compute_seconds_local += stop_gpu_timer(device, gpu_t0)
+            should_log_step = (step % log_every == 0) or (step == steps)
             io_t0 = time.perf_counter()
-            write_local_location_rows(location_writer, step, rank, row0, occupancy, s_counts, i_counts, r_counts)
-            write_local_agent_rows(
-                agent_writer,
-                step,
-                rank,
-                row0,
-                agent_ids,
-                agent_rows,
-                agent_cols,
-                states,
-                old_rows_global,
-                old_cols,
-                moved,
-                exposure,
-                infection_prob,
-                became_infected,
-                became_recovered,
-            )
+            if should_log_step and location_writer is not None:
+                write_local_location_rows(location_writer, step, rank, row0, occupancy, s_counts, i_counts, r_counts)
+            if should_log_step and agent_writer is not None:
+                write_local_agent_rows(
+                    agent_writer,
+                    step,
+                    rank,
+                    row0,
+                    agent_ids,
+                    agent_rows,
+                    agent_cols,
+                    states,
+                    old_rows_global,
+                    old_cols,
+                    moved,
+                    exposure,
+                    infection_prob,
+                    became_infected,
+                    became_recovered,
+                )
             output_io_seconds_local += time.perf_counter() - io_t0
 
             local_counts = torch.tensor(
@@ -1072,6 +1172,12 @@ def run_simulation(
             f"movement_neighborhood={movement_neighborhood}, move_prob={move_prob}"
         )
         print(
+            "Logging: "
+            f"log_agent_history={int(bool(log_agent_history))}, "
+            f"log_location_history={int(bool(log_location_history))}, "
+            f"log_every={log_every}"
+        )
+        print(
             f"Parameters: beta={beta}, gamma={gamma}, steps={steps}, seed={seed} "
             "(step is a discrete simulation timestep; interpret as days if one step = one day)"
         )
@@ -1191,6 +1297,9 @@ def main():
     parser.add_argument("--run-dir", type=str, default=None, help="Optional output directory for a self-contained run folder")
     parser.add_argument("--plot-summary", action="store_true", help="Also generate a PNG summary plot on rank 0 after the run")
     parser.add_argument("--plot-out", type=str, default=None, help="Optional PNG path for the summary plot; default derives it from the summary CSV name")
+    parser.add_argument("--log-agent-history", type=int, default=1, choices=[0, 1], help="Write per-rank agent history CSV files")
+    parser.add_argument("--log-location-history", type=int, default=1, choices=[0, 1], help="Write per-rank location history CSV files")
+    parser.add_argument("--log-every", type=int, default=1, help="Write detailed history every N steps; always logs step 0 and final step")
     args = parser.parse_args()
 
     run_simulation(
@@ -1209,6 +1318,9 @@ def main():
         run_dir=args.run_dir,
         plot_summary_png=args.plot_summary,
         plot_out=args.plot_out,
+        log_agent_history=bool(args.log_agent_history),
+        log_location_history=bool(args.log_location_history),
+        log_every=args.log_every,
     )
 
 

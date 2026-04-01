@@ -13,6 +13,8 @@ RESULTS_BASE="${RESULTS_BASE:-results/agent_location_sweep}"
 PLOT_SUMMARY="${PLOT_SUMMARY:-1}"
 START_RUN="${START_RUN:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+LOG_AGENT_HISTORY="${LOG_AGENT_HISTORY:-0}"
+LOG_LOCATION_HISTORY="${LOG_LOCATION_HISTORY:-0}"
 
 AGENT_COUNTS=(
   10000
@@ -45,6 +47,8 @@ echo "Results base: ${RESULTS_BASE}"
 echo "Total runs: $((${#AGENT_COUNTS[@]} * ${#LOCATION_COUNTS[@]}))"
 echo "Starting from run: ${START_RUN}"
 echo "Dry run: ${DRY_RUN}"
+echo "Log agent history: ${LOG_AGENT_HISTORY}"
+echo "Log location history: ${LOG_LOCATION_HISTORY}"
 echo
 
 run_index=0
@@ -101,6 +105,8 @@ PY
       "--cols" "${cols}"
       "--num-agents" "${num_agents}"
       "--run-dir" "${run_dir}/"
+      "--log-agent-history" "${LOG_AGENT_HISTORY}"
+      "--log-location-history" "${LOG_LOCATION_HISTORY}"
     )
 
     if [[ "${PLOT_SUMMARY}" == "1" ]]; then

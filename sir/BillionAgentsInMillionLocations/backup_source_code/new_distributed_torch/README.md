@@ -14,8 +14,8 @@ The model keeps the same moving-agent SIR idea as the single-process CPU version
 
 - creates a global `rows x cols` grid of locations
 - partitions the grid by row blocks across distributed ranks
-- initializes the full population on rank 0 and broadcasts it
-- assigns each agent to the rank that owns its current row range
+- initializes only the locally owned population on each rank
+- assigns agents to the rank that owns their current row range
 - stores each rank's local agents in PyTorch tensors on the selected device
 - moves agents each step
 - migrates agents across neighboring row partitions when movement crosses a rank boundary
@@ -98,6 +98,12 @@ This means:
   Generate a rank 0 PNG summary plot after the run.
 - `--plot-out`
   Optional explicit PNG path.
+- `--log-agent-history`
+  Allowed values: `0`, `1`
+- `--log-location-history`
+  Allowed values: `0`, `1`
+- `--log-every`
+  Write detailed history rows every `N` steps when history logging is enabled.
 
 ## Moving-Agent Parameters
 
@@ -172,7 +178,7 @@ The current implementation uses:
 - nearest-neighbor communication only in the vertical direction
 - MPI reductions for global summary values
 - MPI `Sendrecv` for row-boundary infection data
-- MPI `allgather` of migration payloads for agents crossing neighboring rank boundaries
+- MPI `Sendrecv` count exchange and payload exchange for agents crossing neighboring rank boundaries
 
 More specifically:
 
@@ -181,6 +187,91 @@ More specifically:
 - when `infection_neighborhood=same_plus_news`, a rank needs infected counts from the top and bottom neighboring ranks to compute exposure at its boundary rows
 - horizontal neighbors are local within the same rank because the decomposition is by rows, not by columns
 - global S/I/R values, occupied-location counts, and moved-agent counts are reduced to rank 0 each step
+
+## Recent Implementation Changes
+
+The current distributed implementation includes several changes that were made to reduce CPU overhead, reduce GPU dispatch overhead, and make larger runs practical.
+
+### 1. Local Rank-Owned Initialization
+
+Older versions built a global Python population on rank `0` and distributed it. The current code instead generates only the locally owned population on each rank.
+
+Why this was changed:
+
+- avoids a rank `0` Python-object bottleneck
+- avoids broadcasting the full global population
+- reduces startup overhead and host memory pressure
+- makes the initialization path more scalable for very large agent counts
+
+### 2. Numeric Neighbor-Only Migration Exchange
+
+Older versions used a more Python-heavy migration path. The current code uses flat numeric buffers and exchanges them only with the two neighboring ranks.
+
+Why this was changed:
+
+- reduces Python packing overhead
+- reduces unnecessary communication beyond immediate neighbors
+- better matches the row-partitioned domain decomposition
+
+### 3. Optional History Logging Controls
+
+The distributed code now supports:
+
+- `--log-agent-history 0|1`
+- `--log-location-history 0|1`
+- `--log-every N`
+
+Why this was changed:
+
+- large history CSV files can dominate runtime and storage
+- performance sweeps often need summary timing more than full per-agent history
+- turning history logging off makes comparisons with large runs much fairer
+
+### 4. Vectorized Movement Update
+
+The movement update was changed from a Python loop over moving agents to a batched tensorized implementation.
+
+Why this was changed:
+
+- reduces Python overhead in the per-step hot path
+- reduces GPU kernel and dispatch overhead compared with many small operations
+- improves scaling once each rank owns a larger local agent population
+
+### 5. Chunked Movement Batching
+
+The fully vectorized movement path was later updated again to process moving agents in chunks instead of one giant batch.
+
+Why this was changed:
+
+- very large runs such as `1,000,000,000` agents can produce too many movers on a rank for one giant temporary tensor
+- the earlier fully vectorized path could trigger device out-of-memory errors from large temporary arrays such as candidate positions and random-choice buffers
+- chunking keeps the movement logic batched while capping temporary memory use
+
+Observed tradeoff:
+
+- this can increase runtime slightly for medium and large runs because it adds chunk-loop overhead
+- it can also change the exact random-number consumption order, so post-change runs may not be bitwise identical to pre-change runs even with the same seed
+- aggregate behavior should remain similar, but exact `S/I/R` end counts can shift slightly because the simulation is stochastic
+
+Why the chunked version is still preferred:
+
+- it is much safer for the extreme high-agent cases
+- it preserves the vectorized GPU approach without requiring one giant device allocation
+- it makes the billion-agent end of the sweep much more likely to run without XPU out-of-memory failures
+
+### 6. Reduced Repeated Hot-Loop Allocations
+
+The current code also reduces some repeated overhead in the timestep loop by:
+
+- caching movement-delta tensors
+- caching the `1 - beta` tensor
+- reusing the same cell-id mapping within a step instead of rebuilding location statistics twice after movement
+
+Why this was changed:
+
+- reduces small repeated allocations
+- reduces repeated tensor setup work
+- trims avoidable compute and dispatch overhead from every timestep
 
 Important implication:
 
@@ -213,7 +304,7 @@ That means:
 - the first `4` GPUs each own `5 x 100 = 500` locations
 - the remaining `20` GPUs each own `4 x 100 = 400` locations
 
-Agents are also assigned by row ownership. After rank `0` creates the initial global population, each rank keeps only the agents whose current global row falls inside its row block.
+Agents are also assigned by row ownership. Each rank generates and keeps the agents whose current global row falls inside its row block.
 
 During the run:
 
@@ -271,7 +362,7 @@ Per rank, the main local state includes:
 - local exposure and infection-probability arrays
 
 Global arrays are not permanently stored on every rank.
-Only rank 0 briefly constructs the initial global population before broadcasting it.
+The current code avoids constructing a full global population on every rank.
 
 ### Data Structures And Per-Member Size
 
